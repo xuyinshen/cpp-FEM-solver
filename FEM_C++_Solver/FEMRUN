@@ -1,0 +1,187 @@
+#!/bin/bash
+set -euo pipefail
+
+# =====================================================================
+# FEMRUN —— M0 (FEM Poisson + 制造解) 验证入口
+# ---------------------------------------------------------------------
+# 用法:
+#   ./FEMRUN [子命令] [额外参数...]
+#
+# 子命令:
+#   both        (默认) P1 + P2, nx = 8,16,32
+#   p1 / p2     只跑 P1 / P2
+#   amg-off     关闭 Galerkin 稀疏化 (drop=0 cap=0), 与默认 AMG 做 A/B 对照
+#   amg-verbose 打印 AMG 各层规模与 operator complexity
+#   coarse N     用最粗层阈值 N 跑 (默认 300; 调小 -> 层次更多, setup 更快, 迭代变多)
+#   vtk         输出 poisson_p{1,2}_<nx>.vtk 到当前目录
+#   <预处理器>   ilu0 / ic0 / diag / ssor / none / amg —— 换预处理器跑 P1+P2
+#   sweep       一次跑三组对照: AMG / AMG关稀疏化 / ILU(0)
+#   gmsh FILE   试读 Gmsh .msh (只打印规模, 不求解)
+#   raw ...     后面参数原样转发给 fem_test_app, 不做任何加工
+#   help        打印本帮助
+#
+# 环境变量:
+#   SKIP_BUILD=1        跳过编译, 直接跑现有 ./bin/fem_test_app
+#   CLEAN=1             编译前 rm -rf build (默认增量编译)
+#   OMP_NUM_THREADS=N   限制 OpenMP 线程数
+#   FEMRUN_LOG=path     指定日志落盘位置 (默认 /tmp/femrun_last.log)
+#
+# 退出码:
+#   0 = 所有阶数判定与自检都通过;  非 0 = 有 FAIL, 或程序本身返回非 0
+#
+# 例:
+#   ./FEMRUN
+#   ./FEMRUN p2 --nx 8,16,32,64
+#   SKIP_BUILD=1 ./FEMRUN amg-off
+#   ./FEMRUN gmsh cavity.msh
+#   ./FEMRUN raw --order 2 --nx 40 --amg-verbose --vtk
+# =====================================================================
+
+BIN=${FEMRUN_BIN:-./bin/fem_test_app}
+LOG=${FEMRUN_LOG:-/tmp/femrun_last.log}
+
+print_help()
+{
+    # 打印文件头第一个 "#####" 注释块, 去掉行首的 "# "
+    awk '/^# =+$/ { c++ } c < 2 && /^#/ && !/^#!/ { sub(/^#[ ]?/, ""); print }' "$0"
+}
+
+# ---- 运行库环境 (与 MPIRUN 保持一致) ----
+# 本项目由 GCC/libgomp 编译, mkl_rt 必须选 GNU threading layer; 否则可能再
+# 加载 libiomp5, 两个 OpenMP runtime 共存会在反复创建线程团队的 AMG/V-cycle
+# 热路径里随机段错误。
+export OMP_DYNAMIC=${OMP_DYNAMIC:-FALSE}
+export OMP_MAX_ACTIVE_LEVELS=${OMP_MAX_ACTIVE_LEVELS:-1}
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+export OMP_PLACES=${OMP_PLACES:-cores}
+export OMP_STACKSIZE=${OMP_STACKSIZE:-64M}
+export MKL_THREADING_LAYER=${MKL_THREADING_LAYER:-GNU}
+export MKL_DYNAMIC=${MKL_DYNAMIC:-FALSE}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+# OMP_NUM_THREADS 只有用户显式给了才导出; 设成空串会让 OpenMP 报错
+if [ -n "${OMP_NUM_THREADS:-}" ]; then export OMP_NUM_THREADS; fi
+
+# ---- 子命令解析 (放在编译之前: help / 参数写错时不该先等一轮编译) ----
+MODE=${1:-both}
+if [ $# -gt 0 ]; then shift; fi
+
+ARGS=()
+while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done
+
+SWEEP=0
+DO_GMSH=0
+PRE=(--order 0)
+
+case "$MODE" in
+    help|-h|--help)  print_help; exit 0 ;;
+    both|"")         PRE=(--order 0) ;;
+    p1)              PRE=(--order 1) ;;
+    p2)              PRE=(--order 2) ;;
+    amg-off)         PRE=(--order 0 --amg-drop 0 --amg-cap 0) ;;
+    amg-verbose)     PRE=(--order 0 --amg-verbose) ;;
+    coarse)          # ./FEMRUN coarse 50 —— 标定 AMG 最粗层阈值 (默认 300)
+        CV=50
+        if [ ${#ARGS[@]} -gt 0 ]; then CV=${ARGS[0]}; ARGS=("${ARGS[@]:1}"); fi
+        PRE=(--order 0 --amg-coarse "$CV")
+        ;;
+    vtk)             PRE=(--order 0 --vtk) ;;
+    sweep)           SWEEP=1 ;;
+    gmsh)            DO_GMSH=1 ;;
+    raw)             PRE=() ;;
+    none|identity|noprecond|cg|\
+    diag|diagonal|jacobi|\
+    ic|ic0|ichol|incomplete_cholesky|\
+    ilu|ilu0|sor|ssor|amg)
+                     PRE=(--order 0 --precond "$MODE") ;;
+    *)
+        echo "[FEMRUN] 未知子命令: $MODE" >&2
+        print_help >&2
+        exit 2
+        ;;
+esac
+
+# ---- 编译 (默认增量; CLEAN=1 才全量重建) ----
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    if [ "${CLEAN:-0}" == "1" ]; then rm -rf build; fi
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j
+else
+    echo "[FEMRUN] SKIP_BUILD=1 -> 跳过编译"
+fi
+
+if [ ! -x "$BIN" ]; then
+    echo "[FEMRUN] 找不到可执行 $BIN —— 编译是否失败?" >&2
+    exit 1
+fi
+
+# ---- 跑一组; 输出同时进 stdout 与日志 ----
+# 注意: sweep 会跑多组, 用 ANY_RC 记住"任一组失败", 否则只有最后一组的状态
+#       会被看到, 前面组崩了也报绿。
+ANY_RC=0
+
+# 行缓冲。程序崩溃时管道里没来得及 flush 的输出会被整段丢掉 ——
+#   sweep 一组要跑 6 个算例, 没有这个就只知道"段错误"而不知道崩在哪一档,
+#   定位成本极高。(stdbuf 是 coreutils 自带, WSL/Linux 都有。)
+STDBUF=""
+if command -v stdbuf >/dev/null 2>&1; then STDBUF="stdbuf -oL"; fi
+
+run_one()
+{
+    local label="$1"; shift
+    printf '\n===== %s =====\n' "$label"
+    local rc=0
+    $STDBUF "$BIN" "$@" 2>&1 | tee -a "$LOG" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ANY_RC=$rc
+        printf '  [FEMRUN] 本组返回码 = %s\n' "$rc"
+    fi
+    return 0
+}
+
+: > "$LOG"
+
+if [ "$DO_GMSH" == "1" ]; then
+    if [ ${#ARGS[@]} -lt 1 ]; then
+        echo "[FEMRUN] gmsh 子命令需要一个 .msh 路径" >&2
+        exit 2
+    fi
+    run_one "Gmsh 读入 ${ARGS[0]}" --gmsh "${ARGS[0]}"
+elif [ "$SWEEP" == "1" ]; then
+    # 额外参数 (例如 --nx 8,16,64) 会追加到每一组, 三组才可比
+    run_one "AMG (drop=0.02, cap=60)"       --order 0 --precond amg ${ARGS[@]+"${ARGS[@]}"}
+    # 关稀疏化这一组额外带 --amg-verbose: 这是唯一会触发 operator complexity
+    #   闸门与"最粗层 Jacobi 安全网"的路径, 每层规模/复杂度/最粗层求解方式
+    #   必须打出来才谈得上诊断。(其余组默认不打, 免得刷屏。)
+    run_one "AMG 关闭 Galerkin 稀疏化 (对照)" --order 0 --precond amg --amg-drop 0 --amg-cap 0 --amg-verbose ${ARGS[@]+"${ARGS[@]}"}
+    run_one "ILU(0) (对照)"                  --order 0 --precond ilu0 ${ARGS[@]+"${ARGS[@]}"}
+else
+    run_one "$MODE" "${PRE[@]}" ${ARGS[@]+"${ARGS[@]}"}
+fi
+
+status=$ANY_RC
+
+# ---- 汇总 ----
+# 判定行: "末档阶数: L2 = x (期望 y),  H1 = z (期望 w)   ->  PASS|FAIL"
+# 自检行: "自检: 1ᵀ M 1 = ... (应为 1)  ->  OK|FAIL"
+n_pass=$(grep -c -- 'PASS' "$LOG" || true)
+n_fail=$(grep -c -- 'FAIL' "$LOG" || true)
+n_ok=$(grep  -c -- '(应为 1)  ->  OK' "$LOG" || true)
+
+printf '\n==================== 汇总 ====================\n'
+printf '  阶数判定 : PASS = %s , FAIL = %s\n' "$n_pass" "$n_fail"
+printf '  质量矩阵自检 (1ᵀ M 1 = 1) : OK = %s\n' "$n_ok"
+printf '  完整日志 : %s\n' "$LOG"
+
+if [ "$status" -ne 0 ]; then
+    printf '  程序返回码 = %s -> FAILED\n' "$status"
+    exit 1
+fi
+if [ "$n_fail" -ne 0 ]; then
+    printf '  存在 FAIL -> FAILED\n'
+    exit 1
+fi
+if [ "$n_pass" -eq 0 ] && [ "$DO_GMSH" -eq 0 ]; then
+    printf '  一条阶数判定都没跑出来, 检查参数 -> FAILED\n'
+    exit 1
+fi
+printf '  全部通过\n'

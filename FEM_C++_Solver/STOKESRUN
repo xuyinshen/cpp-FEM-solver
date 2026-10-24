@@ -1,0 +1,286 @@
+#!/bin/bash
+set -euo pipefail
+
+# =====================================================================
+# STOKESRUN —— M1 (Taylor-Hood P2/P1 稳态 Stokes) 验证入口
+# ---------------------------------------------------------------------
+# 用法:
+#   ./STOKESRUN [子命令] [额外参数...]
+#
+# 子命令:
+#   poiseuille   (默认) 解析解检验: u=(y(1-y),0), p=-2x, f=0
+#                       解析解落在 P2/P1 离散空间内 -> 误差应 ~1e-14
+#                       装配 / 符号 / Dirichlet / 压力 pin 任何一处错,
+#                       误差立刻从 1e-14 掉到 1e-2。敏感度极高。
+#   mms          制造解收敛阶 (流函数构造, 齐次边界)
+#                       理论阶: 速度 L2=3 / H1=2, 压力 L2=2
+#                       注: 阶数由最后两档网格相除得到, 至少要给 2 档,
+#                           只给 1 档会打 SKIP (不是 FAIL)。
+#   both         poiseuille + mms 都跑
+#   amg-off      关闭 Galerkin 稀疏化 (drop=0 cap=0), 与默认 AMG 做 A/B 对照
+#   amg-verbose  打印 AMG 各层规模与 operator complexity
+#   coarse N     最粗层阈值 N (默认 300; 调小 -> 层次更多, setup 更快, 迭代变多)
+#   restart N    GMRES(m) 重启步数 (默认 200; 100 会在 nx>=64 上伪造 h 相关性)
+#   tol V        GMRES 收敛容差 (默认 1e-10)
+#   tolscan [NX] 同一档网格上扫求解容差 (默认 nx=16), 判"误差是代数的还是
+#                离散化的": 若误差随容差线性下降 -> 纯代数误差, 装配没问题;
+#                若误差不随容差下降而停住 -> 离散化/装配 bug。
+#                用法: ./STOKESRUN tolscan 32
+#   pre          速度块预条件横比 (三者共用同一个 Schur 块, 所以差别只来自
+#                  速度块 A^-1 的近似):
+#                  amg    = 标量 AMG (Ruge-Stüben) + 阻尼 Jacobi 光滑  [基线]
+#                  cheb   = 同上, 光滑子换成 Chebyshev 多项式
+#                           -> 明显好于 amg: 根因是"P2 非 M-矩阵, Jacobi 失效"
+#                  blkamg = BlockAMG 光滑聚合 (块 = K_ij*I_2)
+#                           -> 明显好于 amg: 根因是"Ruge-Stüben 粗化在 P2 失效"
+#                  看迭代数 + ms/iter; 迭代数降了才叫改进。
+#                  用法: ./STOKESRUN pre --nx 8,16,32
+#   chebscan [NX] Chebyshev 参数扫描 (默认 nx=32):
+#                  deg=1..4 @ ratio=30;  ratio=10/100 @ deg=2;  deg=3@ratio=10
+#                  deg=1 退化成"每层自适应 omega 的阻尼 Jacobi"
+#                  (omega = 2/(alpha+beta), beta = 该层 Gershgorin 上界)。
+#                  判别: deg=1 就拿到大部分收益 -> 赢在**粗层的自适应缩放**
+#                  (固定的 omega=2/3 在粗层不安全); deg=1 收益小、deg=3/4 才好
+#                  -> 赢在多项式次数 (高频阻尼窗口更宽)。
+#                  用法: ./STOKESRUN chebscan 32
+#   sweep        一次跑四组对照:
+#                  Poiseuille(默认AMG) / MMS(默认AMG)
+#                  Poiseuille(关稀疏化) / MMS(关稀疏化)
+#   raw ...      后面参数原样转发给 stokes_app, 不做任何加工
+#   help         打印本帮助
+#
+# 环境变量:
+#   SKIP_BUILD=1       跳过编译, 直接跑现有 ./bin/stokes_app
+#   CLEAN=1            编译前 rm -rf build (默认增量编译)
+#   OMP_NUM_THREADS=N  限制 OpenMP 线程数
+#   STOKESRUN_LOG=path 指定日志落盘位置 (默认 /tmp/stokesrun_last.log)
+#
+# 退出码:
+#   0 = 所有判定通过;  1 = 有 FAIL;  2 = 参数错误
+#
+# 例:
+#   ./STOKESRUN
+#   ./STOKESRUN mms --nx 8,16,32,64
+#   SKIP_BUILD=1 ./STOKESRUN poiseuille
+#   ./STOKESRUN restart 100
+#   ./STOKESRUN tolscan 32
+#   ./STOKESRUN pre --nx 8,16,32
+#   ./STOKESRUN raw --case mms --nx 16 32 --restart 100 --amg-verbose
+# =====================================================================
+
+BIN=${STOKESRUN_BIN:-./bin/stokes_app}
+LOG=${STOKESRUN_LOG:-/tmp/stokesrun_last.log}
+
+print_help()
+{
+    # 打印文件头第一个 "#####" 注释块, 去掉行首的 "# "
+    awk '/^# =+$/ { c++ } c < 2 && /^#/ && !/^#!/ { sub(/^#[ ]?/, ""); print }' "$0"
+}
+
+# ---- 运行库环境 (与 FEMRUN / MPIRUN 保持一致) ----
+# 本项目由 GCC/libgomp 编译, mkl_rt 必须选 GNU threading layer; 否则可能再
+# 加载 libiomp5, 两个 OpenMP runtime 共存会在反复创建线程团队的 AMG/V-cycle
+# 热路径里随机段错误。
+export OMP_DYNAMIC=${OMP_DYNAMIC:-FALSE}
+export OMP_MAX_ACTIVE_LEVELS=${OMP_MAX_ACTIVE_LEVELS:-1}
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+export OMP_PLACES=${OMP_PLACES:-cores}
+export OMP_STACKSIZE=${OMP_STACKSIZE:-64M}
+export MKL_THREADING_LAYER=${MKL_THREADING_LAYER:-GNU}
+export MKL_DYNAMIC=${MKL_DYNAMIC:-FALSE}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+# OMP_NUM_THREADS 只有用户显式给了才导出; 设成空串会让 OpenMP 报错
+if [ -n "${OMP_NUM_THREADS:-}" ]; then export OMP_NUM_THREADS; fi
+
+# ---- 子命令解析 (放在编译之前: help / 参数写错时不该先等一轮编译) ----
+MODE=${1:-poiseuille}
+if [ $# -gt 0 ]; then shift; fi
+
+ARGS=()
+while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done
+
+SWEEP=0
+PRE=(--case poiseuille)
+
+case "$MODE" in
+    help|-h|--help)  print_help; exit 0 ;;
+    poiseuille|"")   PRE=(--case poiseuille) ;;
+    mms)             PRE=(--case mms) ;;
+    both)            SWEEP=2 ;;
+    tolscan)         SWEEP=3 ;;
+
+    amg-off)         PRE=(--case poiseuille --amg-drop 0 --amg-cap 0) ;;
+    amg-verbose)     PRE=(--case poiseuille --amg-verbose) ;;
+    coarse)          # ./STOKESRUN coarse 50 —— 标定 AMG 最粗层阈值 (默认 300)
+        CV=50
+        if [ ${#ARGS[@]} -gt 0 ]; then CV=${ARGS[0]}; ARGS=("${ARGS[@]:1}"); fi
+        PRE=(--case poiseuille --amg-coarse "$CV")
+        ;;
+    restart)         # ./STOKESRUN restart 100 —— GMRES(m) 重启步数
+        RV=100
+        if [ ${#ARGS[@]} -gt 0 ]; then RV=${ARGS[0]}; ARGS=("${ARGS[@]:1}"); fi
+        PRE=(--case poiseuille --restart "$RV")
+        ;;
+    tol)             # ./STOKESRUN tol 1e-12 —— 收紧容差 (Poiseuille 离散误差虽为舍入量级,
+                     #   但可见误差受代数残差与压力 pin 放大控制)
+        TV=1e-12
+        if [ ${#ARGS[@]} -gt 0 ]; then TV=${ARGS[0]}; ARGS=("${ARGS[@]:1}"); fi
+        PRE=(--case poiseuille --tol "$TV")
+        ;;
+    sweep)           SWEEP=1 ;;
+    pre)             SWEEP=4 ;;
+    chebscan)        SWEEP=5 ;;
+    raw)             PRE=() ;;
+    *)
+        echo "[STOKESRUN] 未知子命令: $MODE" >&2
+        print_help >&2
+        exit 2
+        ;;
+esac
+
+# ---- 编译 (默认增量; CLEAN=1 才全量重建) ----
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    if [ "${CLEAN:-0}" == "1" ]; then rm -rf build; fi
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j
+else
+    echo "[STOKESRUN] SKIP_BUILD=1 -> 跳过编译"
+fi
+
+if [ ! -x "$BIN" ]; then
+    echo "[STOKESRUN] 找不到可执行 $BIN —— 编译是否失败?" >&2
+    exit 1
+fi
+
+# ---- 跑一组; 输出同时进 stdout 与日志 ----
+# 注意: sweep 会跑多组, 用 ANY_RC 记住"任一组失败", 否则只有最后一组的状态
+#       会被看到, 前面组崩了也报绿。
+ANY_RC=0
+
+# 行缓冲。程序崩溃时管道里没来得及 flush 的输出会被整段丢掉 ——
+#   没有这个就只知道"段错误"而不知道崩在哪一档, 定位成本极高。
+#   (stdbuf 是 coreutils 自带, WSL/Linux 都有。)
+STDBUF=""
+if command -v stdbuf >/dev/null 2>&1; then STDBUF="stdbuf -oL"; fi
+
+run_one()
+{
+    local label="$1"; shift
+    printf '\n===== %s =====\n' "$label"
+    local rc=0
+    $STDBUF "$BIN" "$@" 2>&1 | tee -a "$LOG" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ANY_RC=$rc
+        printf '  [STOKESRUN] 本组返回码 = %s\n' "$rc"
+    fi
+    return 0
+}
+
+: > "$LOG"
+
+if [ "$SWEEP" == "1" ]; then
+    # 额外参数 (例如 --nx 8,16,32) 会追加到每一组, 各组才可比
+    #  注意: mms 判定需要 >= 2 档网格, 单独给 --nx 16 会让 mms 那两组打 SKIP。
+    run_one "Poiseuille — 默认 AMG (drop=0.02, cap=60)" \
+        --case poiseuille ${ARGS[@]+"${ARGS[@]}"}
+    run_one "MMS — 默认 AMG (drop=0.02, cap=60)" \
+        --case mms ${ARGS[@]+"${ARGS[@]}"}
+    # 关稀疏化这两组额外带 --amg-verbose: 这是唯一会触发 operator complexity
+    #   闸门与"最粗层 Jacobi 安全网"的路径, 每层规模/复杂度/最粗层求解方式
+    #   必须打出来才谈得上诊断。(其余组默认不打, 免得刷屏。)
+    run_one "Poiseuille — 关闭 Galerkin 稀疏化 (对照)" \
+        --case poiseuille --amg-drop 0 --amg-cap 0 --amg-verbose ${ARGS[@]+"${ARGS[@]}"}
+    run_one "MMS — 关闭 Galerkin 稀疏化 (对照)" \
+        --case mms --amg-drop 0 --amg-cap 0 --amg-verbose ${ARGS[@]+"${ARGS[@]}"}
+elif [ "$SWEEP" == "2" ]; then
+    run_one "Poiseuille (解析解检验)" --case poiseuille ${ARGS[@]+"${ARGS[@]}"}
+    run_one "MMS (收敛阶检验)"        --case mms       ${ARGS[@]+"${ARGS[@]}"}
+elif [ "$SWEEP" == "4" ]; then
+    # ---- 速度块预条件横比 ----
+    #   把"光滑子不行"和"粗化不行"分开: 三者共用同一个 Schur 块 (已用
+    #   广义特征问题验证过 kappa(G, Mp) ~ 7.4 且与 h 无关), 所以迭代数的差别
+    #   只可能来自速度块 A^-1 的近似:
+    #     amg    = 标量 AMG (Ruge-Stüben C/F 分裂) + 阻尼 Jacobi 光滑
+    #     cheb   = 同上, 只把光滑子换成 Chebyshev 多项式
+    #              -> 若 cheb 明显好于 amg: 根因是"P2 不是 M-矩阵, Jacobi 光滑失效"
+    #     blkamg = BlockAMG 光滑聚合 (块 = K_ij*I_2, 命中 BS=2 标量快速路径)
+    #              -> 若 blkamg 明显好于 amg: 根因是"Ruge-Stüben 粗化在 P2 上失效"
+    #   看迭代数 + ms/iter: 迭代数降了才叫改进, 单价降而迭代数涨是负收益。
+    run_one "Poiseuille — 速度块: 标量 AMG + Jacobi (基线)" \
+        --case poiseuille --vel-precond amg    ${ARGS[@]+"${ARGS[@]}"}
+    #   cheb 这一组显式带上实测甜点 (deg=3, ratio=30): 默认 deg=2 会比甜点
+    #   慢约 1.6x, 横比时不能让"默认参数"掩盖真实差距。
+    run_one "Poiseuille — 速度块: 标量 AMG + Chebyshev (deg=3, ratio=30)" \
+        --case poiseuille --vel-precond cheb --amg-cheb-deg 3 --amg-cheb-ratio 30 \
+        ${ARGS[@]+"${ARGS[@]}"}
+    run_one "Poiseuille — 速度块: BlockAMG 光滑聚合" \
+        --case poiseuille --vel-precond blkamg ${ARGS[@]+"${ARGS[@]}"}
+elif [ "$SWEEP" == "3" ]; then
+    # 固定一档网格, 只改求解容差。
+    #   判断标准: 把 (残差, 误差) 画在双对数上, 斜率 ~1 => 误差 = ||M^{-1}|| * 残差,
+    #   即纯代数误差, 离散化是精确的, 不要再查 A/B/B^T。
+    #   斜率 ~0 (误差不随容差下降) => 真的有离散化/装配问题。
+    #   这是唯一能把"求解器不够准"和"装配有错"分开的实验, 两者排查方向相反。
+    NXF=${ARGS[0]:-16}
+    for T in 1e-6 1e-8 1e-10 1e-12 1e-14; do
+        run_one "Poiseuille nx=$NXF tol=$T" --case poiseuille --nx "$NXF" --tol "$T"
+    done
+
+elif [ "$SWEEP" == "5" ]; then
+    # ---- chebscan: Chebyshev 光滑子参数网格 ----
+    NXC=32
+    if [ ${#ARGS[@]} -gt 0 ]; then NXC=${ARGS[0]}; ARGS=("${ARGS[@]:1}"); fi
+    #   基线 (阻尼 Jacobi) 先跑一遍, 后面所有组都跟它比。
+    run_one "Jacobi 基线 (nx=$NXC)" --case poiseuille --nx "$NXC" --vel-precond amg
+    #   deg = 1 是判别性最强的一组: 它退化成"每层自适应 omega 的阻尼 Jacobi"
+    #   (omega = 2/(alpha+beta), beta 由该层 Gershgorin 上界估出)。
+    #   若 deg=1 就拿到大部分收益 -> 赢在自适应缩放 (多半是粗层 omega=2/3 不安全);
+    #   若 deg=1 收益很小而 deg=3/4 才好 -> 赢在多项式次数 (高频阻尼窗口更宽)。
+    for D in 1 2 3 4; do
+        run_one "Cheb deg=$D ratio=30 (nx=$NXC)" \
+            --case poiseuille --nx "$NXC" --vel-precond cheb \
+            --amg-cheb-deg "$D" --amg-cheb-ratio 30
+    done
+    for R in 10 100; do
+        run_one "Cheb deg=2 ratio=$R (nx=$NXC)" \
+            --case poiseuille --nx "$NXC" --vel-precond cheb \
+            --amg-cheb-deg 2 --amg-cheb-ratio "$R"
+    done
+    run_one "Cheb deg=3 ratio=10 (nx=$NXC)" \
+        --case poiseuille --nx "$NXC" --vel-precond cheb \
+        --amg-cheb-deg 3 --amg-cheb-ratio 10
+else
+    run_one "$MODE" "${PRE[@]}" ${ARGS[@]+"${ARGS[@]}"}
+fi
+
+status=$ANY_RC
+
+# ---- 汇总 ----
+# 判定行两种形态:
+#   Poiseuille: "  判定: 最细档 u-L2 = ... (阈值 1e-10)   ->  PASS|FAIL"
+#   MMS:        "  末档阶数: 速度 L2 = ... (期望 3.00) ... ->  PASS|FAIL|SKIP"
+n_pass=$(grep -c -- 'PASS' "$LOG" || true)
+n_fail=$(grep -c -- 'FAIL' "$LOG" || true)
+n_skip=$(grep -c -- 'SKIP' "$LOG" || true)
+# 残差/迭代健康度: 把表格里的 iters 与 ‖∇·u‖ 抓出来, 便于一眼看出
+#   "收敛了但散度不趋于 0" 这类只有 Stokes 才有的失败模式。
+n_div=$(grep -c -- '‖∇·u‖' "$LOG" || true)
+
+printf '\n==================== 汇总 ====================\n'
+printf '  判定 : PASS = %s , FAIL = %s , SKIP = %s\n' "$n_pass" "$n_fail" "$n_skip"
+printf '  表格组数 (含 ‖∇·u‖ 列) : %s\n' "$n_div"
+printf '  完整日志 : %s\n' "$LOG"
+
+if [ "$status" -ne 0 ]; then
+    printf '  程序返回码 = %s -> FAILED\n' "$status"
+    exit 1
+fi
+if [ "$n_fail" -ne 0 ]; then
+    printf '  存在 FAIL -> FAILED\n'
+    exit 1
+fi
+if [ "$n_pass" -eq 0 ]; then
+    printf '  一条判定都没跑出来, 检查参数 -> FAILED\n'
+    exit 1
+fi
+printf '  全部通过\n'

@@ -1,0 +1,80 @@
+#!/bin/bash
+set -euo pipefail
+
+# =====================================================================
+# 用法:
+#   ./MPIRUN serial [传给 smatrix_test_app 的参数...]
+#   ./MPIRUN mpi <NP> [传给 smatrix_test_app 的参数...]
+#
+# 例:
+#   ./MPIRUN serial
+#   ./MPIRUN serial 32 --amg-smooth 1
+#   ./MPIRUN serial --amg-smooth 1 --adapt-thr 5
+#   SKIP_BUILD=1 ./MPIRUN serial 32 --amg-smooth 1      # 跳过重新编译
+#
+# 【踩过的坑 —— 别再犯】
+#   以前这一行只写 ./bin/smatrix_test_app, 没有 "$@"; 同时 NP=${2:-4}
+#   会把 "--amg-smooth" 当成进程数吃掉, 后面的 "1" 被静默丢弃。
+#   结果 ./MPIRUN serial --amg-smooth 1 跑的其实是默认配置,
+#   两次不同参数的日志一模一样 —— 参数开关看起来"没效果", 其实根本没传进去。
+#   现在: MODE(以及 mpi 模式的 NP) 之后的所有参数原样转发给可执行程序,
+#   并回显一行确认, 让这种静默丢失不可能再发生。
+# =====================================================================
+
+MODE=${1:-serial}
+if [ $# -gt 0 ]; then shift; fi
+
+NP=1
+if [ "$MODE" == "mpi" ]; then
+    NP=${1:-4}
+    if [ $# -gt 0 ]; then shift; fi
+fi
+
+ARGS=()
+while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done
+
+# OpenMP/MKL 运行库一致性：本项目由 GCC/libgomp 编译，mkl_rt 必须选择 GNU
+# threading layer。否则 mkl_rt 可能再加载 libiomp5；两个 OpenMP runtime 共存
+# 会在反复创建线程团队的 GMRES/Arnoldi 热路径中随机段错误。
+export OMP_DYNAMIC=${OMP_DYNAMIC:-FALSE}
+export OMP_MAX_ACTIVE_LEVELS=${OMP_MAX_ACTIVE_LEVELS:-1}
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+export OMP_PLACES=${OMP_PLACES:-cores}
+# 显式给出 OpenMP 工作线程栈: Krylov/AMG 里有递归与较大的栈上块,
+# 子线程栈不足的典型表现正是只有把线程数调高才崩溃。
+export OMP_STACKSIZE=${OMP_STACKSIZE:-64M}
+export MKL_THREADING_LAYER=${MKL_THREADING_LAYER:-GNU}
+export MKL_DYNAMIC=${MKL_DYNAMIC:-FALSE}
+# Krylov/AMG 外层已经由 OpenMP 并行；MKL 内层默认单线程，避免嵌套过量并行。
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+# WSL2 mpirun 环境修复
+export OMPI_MCA_btl=self,vader,tcp
+export OMPI_MCA_btl_tcp_if_include=lo
+export OMPI_MCA_oob_tcp_if_include=lo
+export OMPI_MCA_ptl_tcp_if_include=lo
+export PRTE_MCA_ptl_tcp_if_include=lo
+
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    rm -rf build
+    if [ "$MODE" == "mpi" ]; then
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=mpicxx
+    else
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+    fi
+    cmake --build build -j
+else
+    echo "[MPIRUN] SKIP_BUILD=1 -> 跳过编译, 直接用现有 ./bin/smatrix_test_app"
+fi
+
+printf '[MPIRUN] MODE=%s' "$MODE"
+if [ "$MODE" == "mpi" ]; then printf ' NP=%s' "$NP"; fi
+printf ' | 转发给 smatrix_test_app:'
+if [ ${#ARGS[@]} -gt 0 ]; then printf ' %s' "${ARGS[@]}"; else printf ' (无)'; fi
+printf '\n'
+
+if [ "$MODE" == "mpi" ]; then
+    mpirun -np "$NP" --oversubscribe ./bin/smatrix_test_app ${ARGS[@]+"${ARGS[@]}"}
+else
+    ./bin/smatrix_test_app ${ARGS[@]+"${ARGS[@]}"}
+fi

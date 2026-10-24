@@ -1,0 +1,238 @@
+#!/bin/bash
+set -euo pipefail
+
+# =====================================================================
+# NSRUN —— M2 (Taylor-Hood P2/P1 稳态 Navier-Stokes) 验证入口
+# ---------------------------------------------------------------------
+# 用法:
+#   ./NSRUN [子命令] [额外参数...]
+#
+# 子命令:
+#   cavity   (默认) 方腔驱动流 + Ghia (1982) 基准
+#                   顶盖 u=(1,0), 其余三边无滑移, f=0, nu=1/Re
+#                   判据: 中心线 17 个点的 u / v 剖面与 Ghia Table I/II 的
+#                   合成 RMS < --ghia-tol (默认 0.02)
+#   mms      制造解收敛阶 (右端项含对流项)
+#                   目的: 在**没有基准数据**的前提下单独验对流项 C 与
+#                   Newton 项 G 的装配与符号 —— 理论阶为 3/2/2；
+#                   判据检查不得显著降阶，并允许结构化网格超收敛。
+#   both     cavity + mms 都跑
+#   verbose  打开 Newton 每步的残差/迭代输出
+#   amg-verbose  再叠加 AMG 层次打印
+#   pre      速度块预条件的 A/B (cd<->cheb 是"光滑子 A/B",
+#                            cheb<->stokes 是"算子 A/B"):
+#                   cd     = 标量 AMG on nuK + C + 阻尼 Jacobi 光滑
+#                   jac    = cd 的同义写法
+#                   cheb   = 标量 AMG on nuK + C + Chebyshev 光滑 (**默认**;
+#                            M1 在同一个 P2 速度算子上实测: nx=32 Jacobi 348
+#                            次 vs Chebyshev 100 次, 且 Jacobi 随 h 明显增长)
+#                   stokes = 标量 AMG 只建在 nuK 上 (光滑子沿用默认;
+#                            看"把对流项放进预条件值不值": 高 Re 下两者
+#                            差别会迅速拉开)
+#                   blk    = BlockAMG 光滑聚合 on nuK + C
+#                   ilu    = ILU(0) on 完整 A = nuK + C + G (含 Newton 项)
+#   schur    Schur 补块预条件的 A/B:
+#                   lsc    = LSC/BFBt: E⁻¹(B Mv⁻¹ A Mv⁻¹ Bᵀ)E⁻¹, E = B Mv⁻¹ Bᵀ
+#                            (Oseen 型; 连续意义下与真 S⁻¹ 逐项相同。
+#                             注意：它只有在 E⁻¹ 做得准时才有效,
+#                             单次 V-cycle 会比 mass 还慢)
+#                   mass   = nu·Mp⁻¹ (Stokes 型, 默认; 丢掉 i·u·k/k² 项,
+#                            高频端差一个网格雷诺数。高 Re 停滞的经典根因)
+#   stab     稳定项 / 顶盖提法的 A/B (高 Re 专用):
+#                   1) SUPG + 光滑顶盖 (默认配置)
+#                   2) 关掉 SUPG (纯 Galerkin)          —— 看 SUPG 贡献了多少
+#                   3) SUPG + 硬设置顶盖 (Ghia 原始提法) —— 看角点奇性贡献了多少
+#   raw ...  后面参数原样转发给 ns_app
+#   help     打印本帮助
+#
+# 常用参数 (转发给 ns_app):
+#   --nx 32            网格 (默认 32; Ghia 用 129x129, P2 在 nx=32 上
+#                      速度自由度已是 65x65, 与之一档)
+#   --verbose          打印每个 Newton 步的 ‖R‖ / eta / GMRES 真实相对残差
+#   --re 100,200,400,700,1000  Re 延拓序列 (默认; 上一档解作下一档初值。
+#                      只 100/400/1000 三档与 Ghia 对比, 中间档只判收敛)
+#   --restart 200      GMRES(m) 重启步数 (默认 200)
+#   --max-lin 3000     单次线性求解的 GMRES 上限 (默认 3000, 与 restart 解耦)
+#                       打满不再直接掐死 Newton: 只要真实相对残差 < 0.1,
+#                       该方向仍会被接受, 同时把后续 eta 的下界抬上去
+#   --newton-tol 1e-10 Newton 收敛判据 (相对首步残差)
+#   --lin-tol-min 1e-10 Eisenstat-Walker 强制项下界。验阶时不要放松：压强误差
+#                       对线性残差非常敏感, 1e-6 会把收敛阶击坏
+#   --schur mass|lsc  Schur 补预条件 (默认 mass)
+#   --lsc-cycles N    LSC 中 E⁻¹ 的 V-cycle 次数 (默认 2)
+#   --ghia-tol 0.02    Ghia 剖面合成 RMS 阈值
+#   --supg on|off      SUPG 稳定项 (默认 on)。高 Re 下它不只是"稳定性":
+#                      沿流线补的扩散 tau|u|^2 比 nu 本身大一个量级, 速度块
+#                      重新变成椭圆主导, AMG 才有的可干
+#   --tau-scale 1.0    SUPG tau 的整体缩放 (0 = 关闭, 与 --supg off 等价)
+#   --lid smooth|hard  顶盖两端的速度提法 (默认 smooth: 各用 2 个单元宽的
+#                      smoothstep 过渡, 消掉角点上 |grad u| ~ 1/h 的奇性)
+#   --max-newton 30
+#
+# 环境变量:
+#   SKIP_BUILD=1       跳过编译
+#   CLEAN=1            编译前 rm -rf build
+#   OMP_NUM_THREADS=N
+#   NSRUN_LOG=path     日志落盘位置 (默认 /tmp/nsrun_last.log)
+#
+# 退出码: 0 = 全部通过; 1 = 有 FAIL; 2 = 参数错误
+#
+# 例:
+#   ./NSRUN
+#   ./NSRUN mms --nx 8,16,32
+#   ./NSRUN verbose --nx 32 --re 100,400,1000
+#   ./NSRUN pre   --nx 32 --re 100,400,1000
+#   ./NSRUN schur --nx 32 --re 100,400,1000
+# =====================================================================
+
+BIN=${NSRUN_BIN:-./bin/ns_app}
+LOG=${NSRUN_LOG:-/tmp/nsrun_last.log}
+
+print_help()
+{
+    awk '/^# =+$/ { c++ } c < 2 && /^#/ && !/^#!/ { sub(/^#[ ]?/, ""); print }' "$0"
+}
+
+# ---- 运行库环境 (与 FEMRUN / STOKESRUN 保持一致) ----
+export OMP_DYNAMIC=${OMP_DYNAMIC:-FALSE}
+export OMP_MAX_ACTIVE_LEVELS=${OMP_MAX_ACTIVE_LEVELS:-1}
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+export OMP_PLACES=${OMP_PLACES:-cores}
+export OMP_STACKSIZE=${OMP_STACKSIZE:-64M}
+export MKL_THREADING_LAYER=${MKL_THREADING_LAYER:-GNU}
+export MKL_DYNAMIC=${MKL_DYNAMIC:-FALSE}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+if [ -n "${OMP_NUM_THREADS:-}" ]; then export OMP_NUM_THREADS; fi
+
+# 没写子命令而直接给 --nx/--re 时，按默认 cavity 解释，而不是把
+# "--nx" 误当成子命令。显式子命令仍保持原行为。
+if [ $# -eq 0 ]; then
+    MODE=cavity
+elif [ "$1" = "help" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    MODE=$1
+    shift
+elif [[ "$1" == -* ]]; then
+    MODE=cavity
+else
+    MODE=$1
+    shift
+fi
+
+ARGS=("$@")
+
+SWEEP=0
+PRE=()
+
+case "$MODE" in
+    help|-h|--help)  print_help; exit 0 ;;
+    cavity|"")       PRE=() ;;
+    mms)             PRE=(--case mms) ;;
+    both)            SWEEP=1 ;;
+    verbose)         PRE=(--verbose) ;;
+    amg-verbose)     PRE=(--verbose --amg-verbose) ;;
+    pre)             SWEEP=2 ;;
+    schur)           SWEEP=3 ;;
+    stab)            SWEEP=4 ;;
+    raw)             PRE=() ;;
+    *)
+        echo "[NSRUN] 未知子命令: $MODE" >&2
+        print_help >&2
+        exit 2
+        ;;
+esac
+
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    if [ "${CLEAN:-0}" == "1" ]; then rm -rf build; fi
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j
+else
+    echo "[NSRUN] SKIP_BUILD=1 -> 跳过编译"
+fi
+
+if [ ! -x "$BIN" ]; then
+    echo "[NSRUN] 找不到可执行 $BIN —— 编译是否失败? (新脚本记得 chmod +x)" >&2
+    exit 1
+fi
+
+ANY_RC=0
+STDBUF=""
+if command -v stdbuf >/dev/null 2>&1; then STDBUF="stdbuf -oL"; fi
+
+run_one()
+{
+    local label="$1"; shift
+    printf '\n===== %s =====\n' "$label"
+    local rc=0
+    $STDBUF "$BIN" "$@" 2>&1 | tee -a "$LOG" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ANY_RC=$rc
+        printf '  [NSRUN] 本组返回码 = %s\n' "$rc"
+    fi
+    return 0
+}
+
+: > "$LOG"
+
+if [ "$SWEEP" == "1" ]; then
+    run_one "cavity (Ghia 基准)" ${ARGS[@]+"${ARGS[@]}"}
+    run_one "mms (制造解收敛阶)" --case mms --nx 8,16,32
+elif [ "$SWEEP" == "2" ]; then
+    # 速度块预条件 A/B: 三次跑的是**同一个非线性问题**, 所以 Newton 步数
+    # 应当基本一致, 差别只在每个线性系统的迭代数 —— 这才叫"预条件的差别"。
+    run_one "速度块: AMG on nuK + C (默认)" \
+        --vel-pre cd     ${ARGS[@]+"${ARGS[@]}"}
+    run_one "速度块: AMG on nuK (不含对流)" \
+        --vel-pre stokes ${ARGS[@]+"${ARGS[@]}"}
+    run_one "速度块: AMG on nuK + C, Chebyshev 光滑" \
+        --vel-pre cheb   ${ARGS[@]+"${ARGS[@]}"}
+    run_one "速度块: BlockAMG 光滑聚合 on nuK + C" \
+        --vel-pre blk    ${ARGS[@]+"${ARGS[@]}"}
+    run_one "速度块: ILU(0) on 完整 A = nuK + C + G" \
+        --vel-pre ilu    ${ARGS[@]+"${ARGS[@]}"}
+elif [ "$SWEEP" == "3" ]; then
+    # Schur 补块 A/B: 各组跑的是同一个非线性问题与同一个速度块预条件,
+    # 唯一差别就是 Ũ⁻¹ —— 迭代数的差就是"Schur 近似"这一个因素的贡献。
+    # 第二组指定 --lsc-cycles 1 是为了直接看出 "E⁻¹ 只做一次 V-cycle
+    # 够不够"：LSC 的 Ũ⁻¹ 里 E⁻¹ 出现两次, 单次 V-cycle 的误差会被放大。
+    run_one "Schur: LSC/BFBt, E⁻¹ = 2 次 V-cycle (推荐)" \
+        --schur lsc --lsc-cycles 2  ${ARGS[@]+"${ARGS[@]}"}
+    run_one "Schur: LSC/BFBt, E⁻¹ = 1 次 V-cycle (对照)" \
+        --schur lsc --lsc-cycles 1  ${ARGS[@]+"${ARGS[@]}"}
+    run_one "Schur: nu·Mp⁻¹ (Stokes 型, 默认)" \
+        --schur mass     ${ARGS[@]+"${ARGS[@]}"}
+elif [ "$SWEEP" == "4" ]; then
+    # 稳定项 A/B: 三组跑的是同一个非线性问题与同一套线性求解器, 唯一差别
+    # 就是"有没有 SUPG"和"顶盖怎么给" —— 迭代数的差就是这两个因素的贡献。
+    run_one "SUPG + 光滑顶盖 (默认)" \
+        --supg on --lid smooth  ${ARGS[@]+"${ARGS[@]}"}
+    run_one "纯 Galerkin (关掉 SUPG)" \
+        --supg off --lid smooth ${ARGS[@]+"${ARGS[@]}"}
+    run_one "SUPG + 硬设置顶盖 (Ghia 原始提法)" \
+        --supg on --lid hard    ${ARGS[@]+"${ARGS[@]}"}
+else
+    run_one "$MODE" "${PRE[@]}" ${ARGS[@]+"${ARGS[@]}"}
+fi
+
+status=$ANY_RC
+
+n_pass=$(grep -c -- 'PASS' "$LOG" || true)
+n_fail=$(grep -c -- 'FAIL' "$LOG" || true)
+n_skip=$(grep -c -- 'SKIP' "$LOG" || true)
+
+printf '\n==================== 汇总 ====================\n'
+printf '  判定 : PASS = %s , FAIL = %s , SKIP = %s\n' "$n_pass" "$n_fail" "$n_skip"
+printf '  完整日志 : %s\n' "$LOG"
+
+if [ "$status" -ne 0 ]; then
+    printf '  程序返回码 = %s -> FAILED\n' "$status"
+    exit 1
+fi
+if [ "$n_fail" -ne 0 ]; then
+    printf '  存在 FAIL -> FAILED\n'
+    exit 1
+fi
+if [ "$n_pass" -eq 0 ]; then
+    printf '  一条判定都没跑出来, 检查参数 -> FAILED\n'
+    exit 1
+fi
+printf '  全部通过\n'

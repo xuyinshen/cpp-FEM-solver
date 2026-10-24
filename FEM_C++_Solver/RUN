@@ -1,0 +1,7 @@
+#!/bin/bash
+
+rm -rf build
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+# -DCMAKE_CXX_FLAGS=" -fsanitize=address -g -O0"
+cmake --build build -j
+./bin/smatrix_test_app
